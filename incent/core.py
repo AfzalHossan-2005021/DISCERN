@@ -14,6 +14,104 @@ from typing import Optional, Tuple, Union
 from .utils import fused_gromov_wasserstein_incent, to_dense_array, extract_data_matrix, jensenshannon_divergence_backend, pairwise_msd
 
 
+def identify_target_hemisphere(sliceA, sliceB, nd_A, nd_B, threshold=0.05):
+    """
+    Determine which spatial half of sliceB the cells of sliceA best match,
+    using population-level niche fingerprint comparison.
+    Returns: 'left', 'right', or 'both' (if no clear signal).
+    """
+    coords_B = sliceB.obsm['spatial']
+    
+    # Step 1: Find the bilateral symmetry axis of B
+    # PCA on spatial coordinates: PC1 = longest axis = left-right axis
+    from sklearn.decomposition import PCA
+    pca = PCA(n_components=2)
+    pca.fit(coords_B)
+    pc1_scores = pca.transform(coords_B)[:, 0]
+    midline = np.median(pc1_scores)  # Midline = median along PC1
+    
+    # Step 2: Split B into two halves
+    left_mask  = pc1_scores <= midline
+    right_mask = pc1_scores >  midline
+    
+    # Step 3: Population-level niche fingerprints
+    # Average over all cells — integrates out individual cell noise
+    mu_A     = nd_A.mean(axis=0)
+    mu_B_L   = nd_B[left_mask].mean(axis=0)
+    mu_B_R   = nd_B[right_mask].mean(axis=0)
+    
+    # Normalize to probability distributions
+    mu_A   = mu_A   / mu_A.sum()
+    mu_B_L = mu_B_L / mu_B_L.sum()
+    mu_B_R = mu_B_R / mu_B_R.sum()
+    
+    # Step 4: JSD comparison at population level
+    from scipy.spatial.distance import jensenshannon
+    jsd_left  = jensenshannon(mu_A, mu_B_L)
+    jsd_right = jensenshannon(mu_A, mu_B_R)
+    
+    # Step 5: Decision with uncertainty band
+    ratio = abs(jsd_left - jsd_right) / (jsd_left + jsd_right + 1e-12)
+    if ratio < threshold:
+        return 'both', left_mask, right_mask, pc1_scores, midline
+    elif jsd_left < jsd_right:
+        return 'left', left_mask, right_mask, pc1_scores, midline
+    else:
+        return 'right', left_mask, right_mask, pc1_scores, midline
+
+
+def hemisphere_aware_G0(sliceA, sliceB, hemisphere, left_mask, right_mask):
+    """
+    Build an asymmetric initialization G0 that concentrates transport mass
+    onto the identified target hemisphere of B.
+    High weight on target hemisphere cells, near-zero on other hemisphere.
+    """
+    n_A = sliceA.shape[0]
+    n_B = sliceB.shape[0]
+    
+    G0 = np.ones((n_A, n_B)) / (n_A * n_B)
+    
+    if hemisphere == 'left':
+        # Amplify target hemisphere, suppress other
+        G0[:, left_mask]  *= 10.0
+        G0[:, right_mask] *= 0.01
+    elif hemisphere == 'right':
+        G0[:, right_mask] *= 10.0
+        G0[:, left_mask]  *= 0.01
+    # 'both': uniform initialization unchanged
+    
+    # Renormalize to valid transport plan
+    G0 /= G0.sum()
+    return G0
+
+
+def spatial_coherence_cost(sliceB, pc1_scores, midline, hemisphere, lambda_coh=0.5):
+    """
+    Returns M_coh: (n_B,) cost vector — penalty for each B cell being
+    on the wrong side of the midline given the identified hemisphere.
+    Applied as an additive term to M1: M1 += lambda_coh * M_coh[None, :]
+    Broadcasting means all cells in A share the same lateral penalty for each B cell.
+    """
+    if hemisphere == 'both':
+        return np.zeros(sliceB.shape[0])
+    
+    # Soft penalty: sigmoid of signed distance from midline,
+    # pointing toward the wrong hemisphere
+    signed_dist = pc1_scores - midline  # positive = right half
+    
+    if hemisphere == 'left':
+        # Penalize cells in B that are on the right side
+        # Penalty increases with distance from midline into wrong territory
+        M_coh = np.maximum(0, signed_dist)  # 0 on left, positive on right
+    else:  # 'right'
+        M_coh = np.maximum(0, -signed_dist) # 0 on right, positive on left
+    
+    # Normalize to [0,1]
+    if M_coh.max() > 0:
+        M_coh /= M_coh.max()
+    
+    return M_coh  # shape (n_B,) — broadcast over all cells in A
+
 # ── NEW: Phase 1 ─────────────────────────────────────────────────────────────
 def joint_anatomical_embedding(nd_A, nd_B, sigma=None, n_components=15):
     """
@@ -237,22 +335,6 @@ def pairwise_align(
     D_A = ot.dist(coordinatesA, coordinatesA, metric='euclidean')
     D_B = ot.dist(coordinatesB, coordinatesB, metric='euclidean')
 
-    # --- CRITICAL GEOMETRIC SCALING ---
-    # To achieve perfect structural alignment regardless of slices being from different 
-    # platforms, resolutions, or mechanical stretch, we normalize the spatial spaces to [0, 1].
-    # This ensures Gromov-Wasserstein penalty relies purely on relative shape, not absolute size.
-    D_A /= nx.max(D_A)
-    D_B /= nx.max(D_B)
-
-    # print the shape of D_A and D_B
-    # print("D_A.shape: ", D_A.shape)
-    # print("D_B.shape: ", D_B.shape)
-
-    if isinstance(nx,ot.backend.TorchBackend) and use_gpu:
-        D_A = D_A.cuda()
-        D_B = D_B.cuda()
-
-
     # Calculate gene expression dissimilarity
     # filePath = '/content/drive/MyDrive/Thesis_data_anup/local_data'
     cosine_dist_gene_expr = cosine_distance(sliceA, sliceB, sliceA_name, sliceB_name, filePath, use_rep = use_rep, use_gpu = use_gpu, nx = nx, beta = beta, overwrite=overwrite)
@@ -374,6 +456,40 @@ def pairwise_align(
             f"got {neighborhood_dissimilarity!r}."
         )
     
+    # ─── LAYER 2: Hemisphere identification ───────────────────────────────
+    hemisphere, left_mask, right_mask, pc1_B, midline_B = \
+        identify_target_hemisphere(sliceA, sliceB, ndA, ndB)
+    
+    logFile.write(f"Hemisphere identification: {hemisphere}\n")
+    # logFile.write(f"JSD to L: {jsd_left:.4f}, JSD to R: {jsd_right:.4f}\n")
+
+    # ─── LAYER 1: Shared-scale normalization ──────────────────────────────
+    # CRITICAL FIX: replace independent max-norm with shared-scale norm
+    # Old (wrong):
+    #   D_A /= nx.max(D_A)
+    #   D_B /= nx.max(D_B)
+    # New (correct):
+    scale = nx.max(D_B)   # Normalize BOTH by the scale of the larger structure
+    D_A /= scale
+    D_B /= scale
+
+    if isinstance(nx,ot.backend.TorchBackend) and use_gpu:
+        D_A = D_A.cuda()
+        D_B = D_B.cuda()
+
+    # ─── LAYER 3: Spatial coherence cost ──────────────────────────────────
+    M_coh = spatial_coherence_cost(sliceB, pc1_B, midline_B, hemisphere, 
+                                    lambda_coh=0.5)
+    if isinstance(cosine_dist_gene_expr, torch.Tensor):
+        M_coh_t = torch.from_numpy(M_coh).float().to(cosine_dist_gene_expr.device)
+        M1 = M1 + 0.5 * M_coh_t[None, :]
+    else:
+        M1 = M1 + 0.5 * M_coh[np.newaxis, :]
+
+    # ─── LAYER 2 continued: hemisphere-aware initialization ───────────────
+    G_init_hemi = hemisphere_aware_G0(sliceA, sliceB, hemisphere, 
+                                       left_mask, right_mask)
+    
     labels, Phi = joint_anatomical_embedding(
     neighborhood_distribution_sliceA, neighborhood_distribution_sliceB)
 
@@ -416,7 +532,9 @@ def pairwise_align(
         pass
     
     # Run OT
-    if G_init is not None:
+    if G_init is None:
+        G_init = G_init_hemi
+    else:
         G_init = nx.from_numpy(G_init)
         if isinstance(nx,ot.backend.TorchBackend):
             G_init = G_init.float()

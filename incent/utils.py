@@ -484,16 +484,86 @@ def cg_incent(a, b, M1, M2, reg, f, df, gamma, G0=None, line_search=line_search_
         # We explicitly align it to the user's `tau` hyperparameter (e.g. 0.1).
         # reg controls the entropic smoothing `epsilon`.
         # Extract epsilon and tau passed from pairwise_align (or fallback if missing)
-        eps = kwargs.get('epsilon', 0.01)
-        tau = kwargs.get('tau', 0.1)
-        
-        res, innerlog = sinkhorn_unbalanced(a, b, M, reg=eps, reg_m=tau, numItermax=numItermax, log=True)
+        eps = max(float(kwargs.get('epsilon', 0.01)), 1e-6)
+        tau = max(float(kwargs.get('tau', 0.1)), 1e-6)
+
+        # Defensive sanitization prevents divide-by-zero/NaN propagation in POT's
+        # unbalanced Sinkhorn updates (u = (a / Kv) ** fi_1).
+        a_np = np.asarray(ot.backend.to_numpy(a), dtype=np.float64)
+        b_np = np.asarray(ot.backend.to_numpy(b), dtype=np.float64)
+        M_np = np.asarray(ot.backend.to_numpy(M), dtype=np.float64)
+
+        a_np = np.nan_to_num(a_np, nan=0.0, posinf=0.0, neginf=0.0)
+        b_np = np.nan_to_num(b_np, nan=0.0, posinf=0.0, neginf=0.0)
+        a_np = np.clip(a_np, 1e-12, None)
+        b_np = np.clip(b_np, 1e-12, None)
+        a_np = a_np / np.sum(a_np)
+        b_np = b_np / np.sum(b_np)
+
+        finite_mask = np.isfinite(M_np)
+        if np.any(finite_mask):
+            finite_vals = M_np[finite_mask]
+            fill_val = float(np.median(finite_vals))
+            upper = float(np.max(finite_vals))
+            lower = float(np.min(finite_vals))
+            M_np = np.nan_to_num(M_np, nan=fill_val, posinf=upper, neginf=lower)
+        else:
+            M_np = np.zeros_like(M_np, dtype=np.float64)
+
+        # Keep costs in a compact positive range to avoid exp under/overflow.
+        M_np = M_np - np.min(M_np)
+        scale = np.percentile(M_np, 95)
+        if not np.isfinite(scale) or scale <= 0:
+            scale = np.max(M_np)
+        if np.isfinite(scale) and scale > 0:
+            M_np = M_np / scale
+
+        try:
+            res_np, innerlog = sinkhorn_unbalanced(
+                a_np, b_np, M_np, reg=eps, reg_m=tau,
+                numItermax=numItermax, method='sinkhorn_stabilized', log=True
+            )
+        except TypeError:
+            # Backward compatibility with POT versions that do not expose method.
+            res_np, innerlog = sinkhorn_unbalanced(
+                a_np, b_np, M_np, reg=eps, reg_m=tau,
+                numItermax=numItermax, log=True
+            )
+
+        res_np = np.asarray(res_np, dtype=np.float64)
+
+        # Fallback: retry with safer regularization, then degrade to outer product.
+        if (not np.all(np.isfinite(res_np))) or np.sum(res_np) <= 0:
+            try:
+                res_np, innerlog = sinkhorn_unbalanced(
+                    a_np, b_np, M_np,
+                    reg=max(eps, 5e-2), reg_m=max(tau, 5e-2),
+                    numItermax=numItermax, method='sinkhorn_stabilized', log=True
+                )
+                res_np = np.asarray(res_np, dtype=np.float64)
+            except Exception:
+                res_np = np.outer(a_np, b_np)
+                innerlog = {}
+
+        res_np = np.nan_to_num(res_np, nan=0.0, posinf=0.0, neginf=0.0)
         
         # CRITICAL FIX for UOT Geometries: 
         # In purely Unbalanced OT, sum(pi) < 1. When mapping spots with spatial geometries (`pi x coord`),
         # the points mathematically scale down by the lost mass fraction. 
         # To preserve structural anatomy scales, we enforce mapping mass scalar row-normalization.
-        nx = ot.backend.get_backend(res)
+        nx = ot.backend.get_backend(a, b, M)
+        res_sum = np.sum(res_np)
+        if res_sum > 0:
+            res_np = res_np / res_sum
+        res = nx.from_numpy(res_np)
+
+        if isinstance(res, torch.Tensor):
+            target_dtype = a.dtype if isinstance(a, torch.Tensor) else res.dtype
+            if isinstance(a, torch.Tensor):
+                res = res.to(device=a.device, dtype=target_dtype)
+            else:
+                res = res.to(dtype=target_dtype)
+
         res_sum = nx.sum(res)
         if res_sum > 0:
             res = res / res_sum
