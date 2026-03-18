@@ -456,9 +456,13 @@ def pairwise_align(
             f"got {neighborhood_dissimilarity!r}."
         )
     
+    # Compute neighborhood distributions (existing code)
+    nd_A = neighborhood_distribution_sliceA  # already computed
+    nd_B = neighborhood_distribution_sliceB  # already computed
+    
     # ─── LAYER 2: Hemisphere identification ───────────────────────────────
     hemisphere, left_mask, right_mask, pc1_B, midline_B = \
-        identify_target_hemisphere(sliceA, sliceB, ndA, ndB)
+        identify_target_hemisphere(sliceA, sliceB, nd_A, nd_B)
     
     logFile.write(f"Hemisphere identification: {hemisphere}\n")
     # logFile.write(f"JSD to L: {jsd_left:.4f}, JSD to R: {jsd_right:.4f}\n")
