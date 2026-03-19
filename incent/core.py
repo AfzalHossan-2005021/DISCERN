@@ -14,6 +14,206 @@ from typing import Optional, Tuple, Union
 from .utils import fused_gromov_wasserstein_incent, to_dense_array, extract_data_matrix, jensenshannon_divergence_backend, pairwise_msd
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Generalized partition identification
+# Replaces: identify_target_hemisphere, hemisphere_aware_G0, spatial_coherence_cost
+# Works for any organ, any K, any partition shape
+# ─────────────────────────────────────────────────────────────────────────────
+
+import numpy as np
+from scipy.spatial.distance import jensenshannon
+from sklearn.mixture import GaussianMixture
+
+
+def _spatial_partition_B(coords_B, K):
+    """
+    Fit a K-component Gaussian mixture on B's spatial coordinates.
+    Returns integer partition labels (n_B,) in range [0, K).
+    GMM is the right choice here: handles elongated, asymmetric, and
+    radially arranged regions without assuming equal-size half-planes.
+    """
+    gm = GaussianMixture(
+        n_components=K,
+        covariance_type='full',
+        n_init=5,
+        random_state=42,
+    )
+    return gm.fit_predict(coords_B)
+
+
+def _partition_confidence(nd_B, partition_labels, mu_A, K):
+    """
+    Given K spatial partitions of B and A's mean niche fingerprint,
+    compute the confidence of the best-match assignment.
+
+    confidence = min_JSD / second_min_JSD
+    High confidence → A clearly belongs to one specific partition.
+    Low confidence  → A spans multiple partitions or K is wrong.
+
+    Returns:
+        jsds       : (K,) JSD between mu_A and each partition's mean niche
+        confidence : float  (higher = better K)
+        soft_w     : (K,) softmax weights for each partition
+    """
+    jsds = np.zeros(K)
+    for k in range(K):
+        mask = partition_labels == k
+        if mask.sum() < 5:
+            jsds[k] = 1.0   # degenerate partition → worst possible score
+            continue
+        mu_k = nd_B[mask].mean(axis=0)
+        mu_k = (mu_k + 1e-9) / (mu_k + 1e-9).sum()
+        mu_A_norm = (mu_A + 1e-9) / (mu_A + 1e-9).sum()
+        jsds[k] = float(jensenshannon(mu_A_norm, mu_k))
+
+    sorted_jsds = np.sort(jsds)
+    # Confidence: how much better is the best match than the second best
+    if sorted_jsds[0] < 1e-9:
+        confidence = 1.0
+    elif len(sorted_jsds) == 1:
+        confidence = 1.0
+    else:
+        confidence = sorted_jsds[1] / (sorted_jsds[0] + 1e-9)
+
+    # Soft weights: exponential decay from best match
+    # Temperature τ = median JSD (auto-scales to problem difficulty)
+    tau = float(np.median(jsds)) + 1e-9
+    log_w = -jsds / tau
+    log_w -= log_w.max()
+    soft_w = np.exp(log_w)
+    soft_w /= soft_w.sum()
+
+    return jsds, confidence, soft_w
+
+
+def identify_target_partitions(sliceA, sliceB, nd_A, nd_B,
+                                 max_K=8, min_K=2,
+                                 lambda_coh=0.5,
+                                 verbose=True):
+    """
+    Generalized replacement for identify_target_hemisphere.
+
+    Automatically discovers K spatial partitions of sliceB and identifies
+    which partition(s) best match sliceA's population niche fingerprint.
+
+    Works for any organ:
+      - Brain: K=2 → left/right hemispheres
+      - Kidney: K=3 → cortex/medulla/pelvis
+      - Gut: K=4 → mucosa/submucosa/muscularis/serosa
+      - Spinal cord: K=4 → dorsal/ventral/left/right horns
+      - Liver: K varies → lobule zones (portal/central/intermediate)
+      - General: K discovered automatically
+
+    Parameters
+    ----------
+    sliceA, sliceB : AnnData with .obsm['spatial'] and .obs['cell_type_annot']
+    nd_A           : (n_A, K_ct) neighbourhood distribution of A
+    nd_B           : (n_B, K_ct) neighbourhood distribution of B
+    max_K          : maximum number of partitions to try (default 8)
+    min_K          : minimum number of partitions to try (default 2)
+    lambda_coh     : weight of partition coherence cost added to M1
+    verbose        : print partition discovery diagnostics
+
+    Returns
+    -------
+    partition_labels_B : (n_B,) int array  — spatial partition id per B cell
+    soft_w             : (K,) float array  — match weight per partition
+    K_best             : int               — discovered number of partitions
+    jsds               : (K,) float array  — JSD per partition
+    M_coh_col          : (n_B,) float      — coherence cost column (broadcast to M1)
+    G0                 : (n_A, n_B) float  — informed initialization
+    meta               : dict              — diagnostics
+    """
+    coords_B = sliceB.obsm['spatial'].astype(np.float64)
+    n_A = sliceA.shape[0]
+    n_B = sliceB.shape[0]
+
+    # Population-level niche fingerprint of A
+    mu_A = nd_A.mean(axis=0) if hasattr(nd_A, 'mean') else np.asarray(nd_A).mean(axis=0)
+    if hasattr(mu_A, 'cpu'):   # handle torch tensors
+        mu_A = mu_A.cpu().numpy()
+
+    nd_B_np = nd_B.cpu().numpy() if hasattr(nd_B, 'cpu') else np.asarray(nd_B)
+
+    # ── Auto-select K by maximizing assignment confidence ─────────────────────
+    best_K         = min_K
+    best_conf      = -np.inf
+    best_labels    = None
+    best_soft_w    = None
+    best_jsds      = None
+    conf_per_K     = {}
+
+    for K in range(min_K, max_K + 1):
+        try:
+            labels = _spatial_partition_B(coords_B, K)
+            jsds, conf, soft_w = _partition_confidence(nd_B_np, labels, mu_A, K)
+            conf_per_K[K] = conf
+            if verbose:
+                best_k_idx = int(np.argmin(jsds))
+                print(f"  K={K}: confidence={conf:.3f}  "
+                      f"best_partition={best_k_idx}  "
+                      f"best_JSD={jsds[best_k_idx]:.4f}  "
+                      f"2nd_JSD={np.sort(jsds)[1]:.4f}")
+            if conf > best_conf:
+                best_conf   = conf
+                best_K      = K
+                best_labels = labels
+                best_soft_w = soft_w
+                best_jsds   = jsds
+        except Exception as e:
+            if verbose:
+                print(f"  K={K}: failed ({e})")
+            continue
+
+    if best_labels is None:
+        # Fallback: K=2 with equal weights
+        if verbose:
+            print("  Partition discovery failed, using K=2 uniform.")
+        best_labels  = _spatial_partition_B(coords_B, 2)
+        best_soft_w  = np.array([0.5, 0.5])
+        best_K       = 2
+        best_jsds    = np.array([0.5, 0.5])
+
+    if verbose:
+        print(f"\n  ► Auto-selected K={best_K}  "
+              f"(confidence={best_conf:.3f})")
+        for k in range(best_K):
+            mask = best_labels == k
+            print(f"    Partition {k}: {mask.sum()} B cells  "
+                  f"JSD={best_jsds[k]:.4f}  weight={best_soft_w[k]:.3f}")
+
+    # ── M_coh_col: coherence cost per B cell ──────────────────────────────────
+    # M_coh_col[j] = 1 - soft_w[partition(j)]
+    # High value → cell j is in a partition that A does NOT match → penalise
+    # Low value  → cell j is in A's best-match partition → no penalty
+    M_coh_col = 1.0 - best_soft_w[best_labels]   # (n_B,)
+    # Normalize to [0, 1]
+    if M_coh_col.max() > 0:
+        M_coh_col = M_coh_col / M_coh_col.max()
+
+    # ── G0: partition-aware initialization ────────────────────────────────────
+    # Each B cell gets initial mass proportional to its partition's soft weight.
+    # Amplification ratio: best_w / worst_w, clamped to [1, 100].
+    w_per_cell = best_soft_w[best_labels]   # (n_B,)
+    w_per_cell = w_per_cell / (w_per_cell.mean() + 1e-12)
+    w_per_cell = np.clip(w_per_cell, 0.01, 100.0)
+
+    G0 = np.ones((n_A, n_B)) / (n_A * n_B)
+    G0 = G0 * w_per_cell[np.newaxis, :]   # broadcast over A rows
+    G0 /= G0.sum()                          # valid transport plan
+
+    meta = dict(
+        K_best=best_K,
+        confidence=best_conf,
+        conf_per_K=conf_per_K,
+        jsds=best_jsds,
+        soft_w=best_soft_w,
+        partition_labels_B=best_labels,
+    )
+
+    return best_labels, best_soft_w, best_K, best_jsds, M_coh_col, G0, meta
+
+
 def identify_target_hemisphere(sliceA, sliceB, nd_A, nd_B, threshold=0.05):
     """
     Determine which spatial half of sliceB the cells of sliceA best match,
@@ -461,19 +661,14 @@ def pairwise_align(
     nd_B = neighborhood_distribution_sliceB  # already computed
     
     # ─── LAYER 2: Hemisphere identification ───────────────────────────────
-    hemisphere, left_mask, right_mask, pc1_B, midline_B = \
-        identify_target_hemisphere(sliceA, sliceB, nd_A, nd_B)
+    # hemisphere, left_mask, right_mask, pc1_B, midline_B = \
+    #     identify_target_hemisphere(sliceA, sliceB, nd_A, nd_B)
     
-    logFile.write(f"Hemisphere identification: {hemisphere}\n")
+    # logFile.write(f"Hemisphere identification: {hemisphere}\n")
     # logFile.write(f"JSD to L: {jsd_left:.4f}, JSD to R: {jsd_right:.4f}\n")
 
     # ─── LAYER 1: Shared-scale normalization ──────────────────────────────
-    # CRITICAL FIX: replace independent max-norm with shared-scale norm
-    # Old (wrong):
-    #   D_A /= nx.max(D_A)
-    #   D_B /= nx.max(D_B)
-    # New (correct):
-    scale = nx.max(D_B)   # Normalize BOTH by the scale of the larger structure
+    scale = max(D_A.max(), D_B.max())   # Normalize BOTH by the scale of the larger structure
     D_A /= scale
     D_B /= scale
 
@@ -482,17 +677,53 @@ def pairwise_align(
         D_B = D_B.cuda()
 
     # ─── LAYER 3: Spatial coherence cost ──────────────────────────────────
-    M_coh = spatial_coherence_cost(sliceB, pc1_B, midline_B, hemisphere, 
-                                    lambda_coh=0.5)
-    if isinstance(cosine_dist_gene_expr, torch.Tensor):
-        M_coh_t = torch.from_numpy(M_coh).float().to(cosine_dist_gene_expr.device)
+    # M_coh = spatial_coherence_cost(sliceB, pc1_B, midline_B, hemisphere, 
+    #                                 lambda_coh=0.5)
+    # if isinstance(cosine_dist_gene_expr, torch.Tensor):
+    #     M_coh_t = torch.from_numpy(M_coh).float().to(cosine_dist_gene_expr.device)
+    #     M1 = M1 + 0.5 * M_coh_t[None, :]
+    # else:
+    #     M1 = M1 + 0.5 * M_coh[np.newaxis, :]
+
+    # # ─── LAYER 2 continued: hemisphere-aware initialization ───────────────
+    # G_init_hemi = hemisphere_aware_G0(sliceA, sliceB, hemisphere, 
+    #                                    left_mask, right_mask)
+
+    # ─── In pairwise_align: replace the three brain-specific blocks ───────────────
+
+    # DELETE these three calls:
+    #   hemisphere, left_mask, right_mask, pc1_B, midline_B = identify_target_hemisphere(...)
+    #   M_coh = spatial_coherence_cost(...)
+    #   G_init_hemi = hemisphere_aware_G0(...)
+
+    # REPLACE WITH:
+    if gpu_verbose:
+        print("Discovering spatial partitions of B …")
+
+    nd_A_np = (neighborhood_distribution_sliceA.cpu().numpy()
+            if hasattr(neighborhood_distribution_sliceA, 'cpu')
+            else np.asarray(neighborhood_distribution_sliceA))
+    nd_B_np = (neighborhood_distribution_sliceB.cpu().numpy()
+            if hasattr(neighborhood_distribution_sliceB, 'cpu')
+            else np.asarray(neighborhood_distribution_sliceB))
+
+    (partition_labels_B, soft_w, K_best,
+    jsds, M_coh_col, G_init_hemi, part_meta) = identify_target_partitions(
+        sliceA, sliceB, nd_A_np, nd_B_np,
+        max_K=8, min_K=2, lambda_coh=0.5, verbose=gpu_verbose)
+
+    logFile.write(f"Partition discovery: K={K_best}  "
+                f"confidence={part_meta['confidence']:.4f}\n")
+    logFile.write(f"JSD per partition: {jsds}\n")
+    logFile.write(f"Soft weights: {soft_w}\n\n")
+
+    # Apply partition coherence cost to M1
+    # M_coh_col is (n_B,): penalises cells in low-match partitions of B
+    if isinstance(M1, torch.Tensor):
+        M_coh_t = torch.from_numpy(M_coh_col).float().to(M1.device)
         M1 = M1 + 0.5 * M_coh_t[None, :]
     else:
-        M1 = M1 + 0.5 * M_coh[np.newaxis, :]
-
-    # ─── LAYER 2 continued: hemisphere-aware initialization ───────────────
-    G_init_hemi = hemisphere_aware_G0(sliceA, sliceB, hemisphere, 
-                                       left_mask, right_mask)
+        M1 = M1 + 0.5 * M_coh_col[np.newaxis, :]
     
     labels, Phi = joint_anatomical_embedding(
     neighborhood_distribution_sliceA, neighborhood_distribution_sliceB)
